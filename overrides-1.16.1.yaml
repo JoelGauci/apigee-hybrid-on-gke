@@ -68,7 +68,7 @@ ingressGateways:
   - name: apigee-ingress
     replicaCountMin: 2
     replicaCountMax: 10
-    svcLoadBalancerIP: 34.38.227.149
+    svcLoadBalancerIP: 1.1.1.1 # not the real IP, just here to hidde the real value! 
     svcType: LoadBalancer
 
 virtualhosts:
