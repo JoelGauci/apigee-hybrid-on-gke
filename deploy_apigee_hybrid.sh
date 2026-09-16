@@ -35,10 +35,16 @@ APIGEE_ENV="${APIGEE_ENV:-test}"
 APIGEE_ENV_GROUP="${APIGEE_ENV_GROUP:-test-group}"
 DOMAIN="${DOMAIN:-1.1.1.1.nip.io}"
 GCP_REGION="${GCP_REGION:-europe-west1}"
-APIGEE_VERSION="${APIGEE_VERSION:-1.16.0}"
+APIGEE_VERSION="${APIGEE_VERSION:-1.17.0}"
 CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-1.19.2}"
-APIGEE_NAMESPACE="apigee"
+APIGEE_NAMESPACE="${APIGEE_NAMESPACE:-apigee}"
 OVERRIDES_FILE="${OVERRIDES_FILE:-overrides.yaml}"
+ENABLE_MCP="${ENABLE_MCP:-false}"
+CONTROL_PLANE_LOCATION="${CONTROL_PLANE_LOCATION:-}"
+
+# Internal runtime flags
+MCP_ONLY_MODE="false"
+CLI_MCP_FLAG_SET="false"
 
 # ==========================================
 # Helper Functions
@@ -47,7 +53,7 @@ log() {
     if command -v gum >/dev/null 2>&1; then
         gum style --foreground 212 "ℹ $1"
     else
-        echo "[INFO] $1"
+        printf "[INFO] %b\n" "$1"
     fi
 }
 
@@ -55,7 +61,7 @@ warn() {
     if command -v gum >/dev/null 2>&1; then
         gum style --foreground 214 "⚠ $1" >&2
     else
-        echo "[WARN] $1" >&2
+        printf "[WARN] %b\n" "$1" >&2
     fi
 }
 
@@ -63,29 +69,162 @@ error() {
     if command -v gum >/dev/null 2>&1; then
         gum style --foreground 9 --bold "✖ $1" >&2
     else
-        echo "[ERROR] $1" >&2
+        printf "[ERROR] %b\n" "$1" >&2
     fi
     exit 1
 }
 
+usage() {
+    cat << 'EOF'
+Usage: ./deploy_apigee_hybrid.sh [OPTIONS]
+
+Deploy Apigee Hybrid on GKE and optionally enable Model Context Protocol (MCP).
+
+Options:
+  --enable-mcp        Enable Apigee MCP Server during full deployment (requires Apigee Hybrid 1.17.0+)
+  --no-mcp            Do not enable Apigee MCP Server during deployment
+  --enable-mcp-only   Enable Apigee MCP Server on an already existing Apigee Hybrid installation
+  -h, --help          Display this help message and exit
+
+Environment Variables (can also be configured in .env):
+  PROJECT_ID          Google Cloud Project ID
+  APIGEE_ORG          Apigee Organization name (defaults to PROJECT_ID)
+  APIGEE_VERSION      Apigee Hybrid version (e.g., 1.17.0)
+  ENABLE_MCP          Set to "true" or "false" to enable/disable MCP by default
+EOF
+}
+
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --enable-mcp)
+                ENABLE_MCP="true"
+                CLI_MCP_FLAG_SET="true"
+                ;;
+            --no-mcp)
+                ENABLE_MCP="false"
+                CLI_MCP_FLAG_SET="true"
+                ;;
+            --enable-mcp-only|enable-mcp)
+                MCP_ONLY_MODE="true"
+                ENABLE_MCP="true"
+                CLI_MCP_FLAG_SET="true"
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                error "Unknown argument: $1. Use --help for usage information."
+                ;;
+        esac
+        shift
+    done
+}
+
+prompt_deployment_options() {
+    # If an explicit CLI flag was provided, skip interactive prompts
+    if [ "$CLI_MCP_FLAG_SET" = "true" ]; then
+        return 0
+    fi
+
+    # Only prompt if standard input is a terminal
+    if [ ! -t 0 ]; then
+        return 0
+    fi
+
+    # Check if an existing Apigee Hybrid installation is present in the cluster
+    EXISTING_INSTALL="false"
+    if kubectl get apigeeorganization -n "$APIGEE_NAMESPACE" >/dev/null 2>&1 || \
+       helm status "$APIGEE_ORG" -n "$APIGEE_NAMESPACE" >/dev/null 2>&1; then
+        EXISTING_INSTALL="true"
+    fi
+
+    if [ "$EXISTING_INSTALL" = "true" ]; then
+        log "An existing Apigee Hybrid installation was detected in namespace '$APIGEE_NAMESPACE'."
+        if command -v gum >/dev/null 2>&1; then
+            CHOICE=$(gum choose \
+                --header "Select deployment mode:" \
+                "Enable MCP on existing installation only" \
+                "Run full deployment (with MCP enabled)" \
+                "Run full deployment (without MCP)")
+            case "$CHOICE" in
+                "Enable MCP on existing installation only")
+                    MCP_ONLY_MODE="true"
+                    ENABLE_MCP="true"
+                    ;;
+                "Run full deployment (with MCP enabled)")
+                    MCP_ONLY_MODE="false"
+                    ENABLE_MCP="true"
+                    ;;
+                *)
+                    MCP_ONLY_MODE="false"
+                    ENABLE_MCP="false"
+                    ;;
+            esac
+        else
+            printf "Select deployment mode:\n"
+            printf "  1) Enable MCP on existing installation only\n"
+            printf "  2) Run full deployment (with MCP enabled)\n"
+            printf "  3) Run full deployment (without MCP)\n"
+            printf "Enter choice [1-3] (default: 1): "
+            read -r USER_CHOICE
+            case "$USER_CHOICE" in
+                2)
+                    MCP_ONLY_MODE="false"
+                    ENABLE_MCP="true"
+                    ;;
+                3)
+                    MCP_ONLY_MODE="false"
+                    ENABLE_MCP="false"
+                    ;;
+                *)
+                    MCP_ONLY_MODE="true"
+                    ENABLE_MCP="true"
+                    ;;
+            esac
+        fi
+    else
+        # No existing installation detected: ask whether to enable MCP during deployment
+        if command -v gum >/dev/null 2>&1; then
+            if gum confirm "Do you want to enable Apigee Model Context Protocol (MCP) during deployment? (Requires Apigee Hybrid 1.17.0+)"; then
+                ENABLE_MCP="true"
+            else
+                ENABLE_MCP="false"
+            fi
+        else
+            printf "Do you want to enable Apigee Model Context Protocol (MCP) during deployment? [y/N]: "
+            read -r MCP_ANS
+            case "$MCP_ANS" in
+                [yY]|[yY][eE][sS])
+                    ENABLE_MCP="true"
+                    ;;
+                *)
+                    ENABLE_MCP="false"
+                    ;;
+            esac
+        fi
+    fi
+}
+
 print_command() {
-    local CMD_STR=""
-    local count=0
-    local total=$#
-    local prev_arg=""
+    CMD_STR=""
+    count=0
+    total=$#
+    prev_arg=""
     
-    local C_LBLUE="$(printf '\033[38;5;117m')"
-    local C_RESET="$(printf '\033[38;5;119m')"
+    C_LBLUE="$(printf '\033[38;5;117m')"
+    C_RESET="$(printf '\033[38;5;119m')"
     
     if command -v gum >/dev/null 2>&1; then
-        local HAS_GUM=1
+        HAS_GUM=1
     else
-        local HAS_GUM=0
+        HAS_GUM=0
     fi
     
     for orig_arg in "$@"; do
-        local arg="$orig_arg"
-        local is_value=0
+        arg="$orig_arg"
+        is_value=0
         
         case "$prev_arg" in
             -*)
@@ -98,11 +237,11 @@ print_command() {
         
         case "$arg" in
             --*=*)
-                local key="${arg%%=*}"
-                local val="${arg#*=}"
+                key="${arg%%=*}"
+                val="${arg#*=}"
                 case "$val" in
                     *[[:space:]\"\'\$\&\|\;\<\>\(\)\{\}]*)
-                        val="$(echo "$val" | sed "s/'/'\\\\''/g")"
+                        val="$(printf "%s" "$val" | sed "s/'/'\\\\''/g")"
                         val="'$val'"
                         ;;
                 esac
@@ -111,7 +250,7 @@ print_command() {
             *)
                 case "$arg" in
                     *[[:space:]\"\'\$\&\|\;\<\>\(\)\{\}]*)
-                        arg="$(echo "$arg" | sed "s/'/'\\\\''/g")"
+                        arg="$(printf "%s" "$arg" | sed "s/'/'\\\\''/g")"
                         arg="'$arg'"
                         ;;
                 esac
@@ -142,7 +281,7 @@ print_command() {
         # Output cleanly without borders so it's easily copy-pasteable, natively coloring base text 119 (Light Green)
         printf "    \033[38;5;119m%b\033[0m\n" "$CMD_STR"
     else
-        echo "  ↳ Command:"
+        printf "  ↳ Command:\n"
         # Use printf to properly evaluate ANSI escapes on all shells consistently
         printf "    \033[38;5;119m%b\033[0m\n" "$CMD_STR"
     fi
@@ -154,12 +293,10 @@ run_with_spin() {
     
     print_command "$@"
     
-    local TMP_ERR
     TMP_ERR=$(mktemp)
 
     if command -v gum >/dev/null 2>&1; then
         if ! gum spin --spinner dot --title "$TITLE" -- sh -c ' "$@" > "$0" 2>&1 ' "$TMP_ERR" "$@"; then
-            local ERR_OUT
             ERR_OUT=$(cat "$TMP_ERR")
             rm -f "$TMP_ERR"
             error "$TITLE failed.
@@ -169,7 +306,6 @@ $ERR_OUT"
     else
         log "$TITLE"
         if ! "$@" > "$TMP_ERR" 2>&1; then
-            local ERR_OUT
             ERR_OUT=$(cat "$TMP_ERR")
             rm -f "$TMP_ERR"
             error "$TITLE failed.
@@ -181,24 +317,23 @@ $ERR_OUT"
 }
 
 step() {
-    local STEP_NUM="$1"
-    local STEP_DESC="$2"
+    STEP_NUM="$1"
+    STEP_DESC="$2"
     if command -v gum >/dev/null 2>&1; then
         gum style --border normal --margin "1" --padding "0 2" --border-foreground 212 "Step $STEP_NUM: $STEP_DESC"
     else
-        echo "=========================================================="
-        echo "Step $STEP_NUM: $STEP_DESC"
-        echo "=========================================================="
+        printf "==========================================================\n"
+        printf "Step %s: %s\n" "$STEP_NUM" "$STEP_DESC"
+        printf "==========================================================\n"
     fi
 }
 
 get_env_encoded_name() {
-    local prefix="$1"
-    local org="$2"
-    local env="$3"
+    prefix="$1"
+    org="$2"
+    env="$3"
 
     # Calculate short SHA based on "org:env" string
-    local sha
     if command -v shasum >/dev/null 2>&1; then
         sha=$(printf "%s" "${org}:${env}" | shasum -a 256 | cut -c1-7)
     else
@@ -206,20 +341,17 @@ get_env_encoded_name() {
     fi
 
     # Calculate short names (first 15 characters)
-    local short_org
     short_org=$(printf "%s" "${org}" | cut -c1-15)
-    local short_env
     short_env=$(printf "%s" "${env}" | cut -c1-15)
 
-    echo "${prefix}-${short_org}-${short_env}-${sha}-sa"
+    printf "%s\n" "${prefix}-${short_org}-${short_env}-${sha}-sa"
 }
 
 get_org_encoded_name() {
-    local prefix="$1"
-    local org="$2"
+    prefix="$1"
+    org="$2"
 
     # Calculate short SHA based on "org" string
-    local sha
     if command -v shasum >/dev/null 2>&1; then
         sha=$(printf "%s" "${org}" | shasum -a 256 | cut -c1-7)
     else
@@ -227,10 +359,9 @@ get_org_encoded_name() {
     fi
 
     # Calculate short name (first 15 characters)
-    local short_name
     short_name=$(printf "%s" "${org}" | cut -c1-15)
 
-    echo "${prefix}-${short_name}-${sha}-sa"
+    printf "%s\n" "${prefix}-${short_name}-${sha}-sa"
 }
 
 check_prereqs() {
@@ -241,7 +372,7 @@ check_prereqs() {
     command -v curl >/dev/null 2>&1 || error "curl is required but not installed."
     
     if ! command -v gum >/dev/null 2>&1; then
-        echo "[INFO] 'gum' not found. Installing 'gum' for visual tracking..."
+        printf "[INFO] 'gum' not found. Installing 'gum' for visual tracking...\n"
         if command -v apt >/dev/null 2>&1; then
             sudo mkdir -p /etc/apt/keyrings
             curl -fsSL https://repo.charm.sh/apt/gpg.key | sudo gpg --dearmor -yes -o /etc/apt/keyrings/charm.gpg
@@ -370,8 +501,9 @@ setup_service_accounts() {
 
     log "Patching create-service-account to add a 30-second delay before key download..."
     sed -i.bak -e 's/gcloud iam service-accounts keys create/echo "Waiting 30 seconds for IAM propagation..."; sleep 30; gcloud iam service-accounts keys create/g' ./apigee-operator/etc/tools/create-service-account
+    rm -f ./apigee-operator/etc/tools/create-service-account.bak
 
-    local missing_sa=0
+    missing_sa=0
     for SA in $SA_LIST; do
         if ! gcloud iam service-accounts describe "${SA}@${PROJECT_ID}.iam.gserviceaccount.com" > /dev/null 2>&1; then
             missing_sa=1
@@ -384,14 +516,14 @@ setup_service_accounts() {
         
         # Display the command clearly to the user
         print_command ./apigee-operator/etc/tools/create-service-account \
-            --env prod \
+            --prod \
             --dir ./service-accounts
 
         # Build a wrapper script to pipe 'y' to the tool to handle its interactive prompts
         cat << 'EOF' > ./create_sas_wrapper.sh
-#!/bin/bash
+#!/bin/sh
 yes | ./apigee-operator/etc/tools/create-service-account \
-    --env prod \
+    --prod \
     --dir ./service-accounts
 EOF
         chmod +x ./create_sas_wrapper.sh
@@ -405,16 +537,17 @@ EOF
 # ==========================================
 # 3.4 Workload Identity Setup
 # ==========================================
+bind_wif() {
+    SA_NAME="$1"
+    KSA_NAME="$2"
+    run_with_spin "Binding $SA_NAME to KSA $KSA_NAME" gcloud iam service-accounts add-iam-policy-binding \
+        "${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
+        --role roles/iam.workloadIdentityUser \
+        --member "serviceAccount:${PROJECT_ID}.svc.id.goog[${APIGEE_NAMESPACE}/${KSA_NAME}]"
+}
+
 setup_workload_identity() {
     log "Setting up Workload Identity bindings for GSA -> KSA..."
-    bind_wif() {
-        local SA_NAME=$1
-        local KSA_NAME=$2
-        run_with_spin "Binding $SA_NAME to KSA $KSA_NAME" gcloud iam service-accounts add-iam-policy-binding \
-            "${SA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
-            --role roles/iam.workloadIdentityUser \
-            --member "serviceAccount:${PROJECT_ID}.svc.id.goog[${APIGEE_NAMESPACE}/${KSA_NAME}]"
-    }
 
     # Org and env scoped wif bindings
     bind_wif "apigee-mart" "$(get_org_encoded_name "apigee-mart" "$APIGEE_ORG")"
@@ -423,6 +556,11 @@ setup_workload_identity() {
     bind_wif "apigee-runtime" "$(get_env_encoded_name "apigee-runtime" "$APIGEE_ORG" "$APIGEE_ENV")"
     bind_wif "apigee-watcher" "$(get_org_encoded_name "apigee-watcher" "$APIGEE_ORG")"
     bind_wif "apigee-mint-task-scheduler" "$(get_org_encoded_name "apigee-mint-task-scheduler" "$APIGEE_ORG")"
+
+    # If MCP is enabled, also bind apigee-watcher GSA to the MCP Server KSA
+    if [ "$ENABLE_MCP" = "true" ]; then
+        bind_wif "apigee-watcher" "$(get_org_encoded_name "apigee-mcp-server" "$APIGEE_ORG")"
+    fi
     
     # Bind Cassandra-related KSAs to the Cassandra backup/objectAdmin SA
     bind_wif apigee-cassandra apigee-cassandra-backup
@@ -430,13 +568,13 @@ setup_workload_identity() {
     bind_wif apigee-cassandra apigee-cassandra-schema-setup
     bind_wif apigee-cassandra apigee-cassandra-user-setup
 
-     # Bind operator, logger & metrics sa
+    # Bind operator, logger & metrics sa
     bind_wif apigee-guardrails apigee-operator-guardrails-sa
     bind_wif apigee-logger apigee-logger-apigee-telemetry
     bind_wif apigee-metrics apigee-metrics-sa
 
     log "Waiting 90 seconds for IAM bindings to propagate across Google Cloud..."
-sleep 90
+    sleep 90
 }
 
 # ==========================================
@@ -506,7 +644,6 @@ create_apigee_organization() {
         rm -f "$TMP_RES"
         return 0
     elif [ "$HTTP_CODE" -ge 400 ]; then
-        local ERR_OUT
         ERR_OUT=$(cat "$TMP_RES")
         rm -f "$TMP_RES"
         error "Failed to create Apigee organization (HTTP $HTTP_CODE).\nDetails:\n$ERR_OUT"
@@ -527,7 +664,6 @@ create_apigee_organization() {
 
             # Check for error field in JSON response
             if grep -q '"error":' "$TMP_STATUS"; then
-                local ERR_OUT
                 ERR_OUT=$(cat "$TMP_STATUS")
                 rm -f "$TMP_STATUS"
                 error "An error occurred during organization creation:\n$ERR_OUT"
@@ -658,6 +794,10 @@ enable_control_plane_access() {
         -H "Content-Type:application/json" \
         "https://apigee.googleapis.com/v1/organizations/$APIGEE_ORG/controlPlaneAccess?update_mask=analytics_publisher_identities" \
         -d '{"analytics_publisher_identities":["serviceAccount:apigee-mart@'"$PROJECT_ID"'.iam.gserviceaccount.com","serviceAccount:apigee-mint-task-scheduler@'"$PROJECT_ID"'.iam.gserviceaccount.com","serviceAccount:apigee-runtime@'"$PROJECT_ID"'.iam.gserviceaccount.com"]}' || true
+
+    if [ "$ENABLE_MCP" = "true" ]; then
+        enable_mcp_control_plane_access
+    fi
 }
 
 # ==========================================
@@ -703,6 +843,7 @@ install_crds() {
     if [ "$APIGEE_NAMESPACE" != "apigee" ]; then
         log "Patching CRD namespace to $APIGEE_NAMESPACE in kustomization.yaml..."
         sed -i.bak "s/namespace: apigee/namespace: $APIGEE_NAMESPACE/g" apigee-operator/etc/crds/default/kustomization.yaml
+        rm -f apigee-operator/etc/crds/default/kustomization.yaml.bak
     fi
 
     run_with_spin "Applying Apigee operator CRDs..." kubectl apply -k "apigee-operator/etc/crds/default/" \
@@ -768,7 +909,7 @@ mintTaskScheduler:
   gsa: "apigee-mint-task-scheduler@${PROJECT_ID}.iam.gserviceaccount.com"
 
 cassandra:
-  # Set to false for single region installations and  for multi-region
+  # Set to false for single region installations and for multi-region
   # installations with connectivity between pods in different clusters,
   # like GKE.
   # Set to true for multi-region installations with no communication
@@ -803,6 +944,10 @@ virtualhosts:
     sslSecret: "apigee-tls-secret"
 EOF
         warn "Please ensure $OVERRIDES_FILE matches your environment requirements before proceeding to production."
+    fi
+
+    if [ "$ENABLE_MCP" = "true" ]; then
+        configure_mcp_in_overrides
     fi
 }
 
@@ -909,11 +1054,10 @@ create_apigee_namespace() {
     else
         log "Creating Kubernetes Namespace '$APIGEE_NAMESPACE'..."
         print_command kubectl create namespace "$APIGEE_NAMESPACE"
-        local CMD_OUT
         CMD_OUT=$(kubectl create namespace "$APIGEE_NAMESPACE" 2>&1)
         
         if [ $? -eq 0 ]; then
-            echo "$CMD_OUT" | awk '{print "    " $0}'
+            printf "%s\n" "$CMD_OUT" | awk '{print "    " $0}'
         else
             error "Failed to create namespace '$APIGEE_NAMESPACE'.\nDetails:\n$CMD_OUT"
         fi
@@ -921,11 +1065,311 @@ create_apigee_namespace() {
 }
 
 # ==========================================
+# 9. Apigee Model Context Protocol (MCP) Enablement
+# Reference: https://docs.cloud.google.com/apigee/docs/api-platform/apigee-mcp/enable-mcp
+# ==========================================
+check_mcp_version_compatibility() {
+    log "Checking Apigee Hybrid version compatibility for MCP (requires 1.17.0 or later)..."
+    MAJOR_VER=$(printf "%s" "$APIGEE_VERSION" | awk -F. '{print $1}')
+    MINOR_VER=$(printf "%s" "$APIGEE_VERSION" | awk -F. '{print $2}')
+
+    if [ -z "$MAJOR_VER" ] || [ -z "$MINOR_VER" ]; then
+        error "Invalid APIGEE_VERSION format: '$APIGEE_VERSION'. Expected semantic version (e.g., 1.17.0)."
+    fi
+
+    if [ "$MAJOR_VER" -lt 1 ] || { [ "$MAJOR_VER" -eq 1 ] && [ "$MINOR_VER" -lt 17 ]; }; then
+        error "Apigee Model Context Protocol (MCP) requires Apigee Hybrid version 1.17.0 or later (current APIGEE_VERSION: $APIGEE_VERSION)."
+    fi
+    log "Version $APIGEE_VERSION is compatible with Apigee MCP."
+
+    # Check if local Helm chart directories exist and match the required version
+    CHARTS_NEED_PULL=0
+    if [ ! -f "apigee-operator/Chart.yaml" ] || [ ! -f "apigee-org/Chart.yaml" ]; then
+        CHARTS_NEED_PULL=1
+    else
+        LOCAL_OP_VER=$(awk '/^version:/{gsub(/["'\'']/, "", $2); print $2}' apigee-operator/Chart.yaml | head -1)
+        if [ "$LOCAL_OP_VER" != "$APIGEE_VERSION" ]; then
+            warn "Local Helm chart version ($LOCAL_OP_VER) does not match APIGEE_VERSION ($APIGEE_VERSION)."
+            CHARTS_NEED_PULL=1
+        fi
+    fi
+
+    if [ "$CHARTS_NEED_PULL" -eq 1 ]; then
+        log "Downloading Apigee Helm charts for version $APIGEE_VERSION..."
+        download_helm_charts
+    fi
+}
+
+# Step 1: Edit overrides.yaml to include top-level enableMcpServer: true
+configure_mcp_in_overrides() {
+    log "Configuring 'enableMcpServer: true' in $OVERRIDES_FILE..."
+    if [ ! -f "$OVERRIDES_FILE" ]; then
+        check_overrides
+        return 0
+    fi
+
+    if grep -q "^enableMcpServer:" "$OVERRIDES_FILE"; then
+        sed -i.bak 's/^enableMcpServer:.*/enableMcpServer: true/' "$OVERRIDES_FILE"
+        rm -f "${OVERRIDES_FILE}.bak"
+        log "Updated existing 'enableMcpServer' setting to 'true' in $OVERRIDES_FILE."
+    else
+        cat << 'EOF' >> "$OVERRIDES_FILE"
+
+# ---- MCP: minimum required -------------------------------------------------
+enableMcpServer: true
+EOF
+        log "Appended 'enableMcpServer: true' to $OVERRIDES_FILE."
+    fi
+}
+
+# Step 2: Grant the watcher identity access to the MCP configuration on the control plane
+enable_mcp_control_plane_access() {
+    log "Granting apigee-watcher identity access to MCP configuration on the Control Plane..."
+    TOKEN=$(gcloud auth print-access-token)
+
+    WATCHER_SA="apigee-watcher@${PROJECT_ID}.iam.gserviceaccount.com"
+    if [ -f "$OVERRIDES_FILE" ]; then
+        EXTRACTED_SA=$(awk '/^watcher:/{flag=1; next} /^[a-zA-Z]/{flag=0} flag && /gsa:/{gsub(/["'\'']/, "", $2); print $2}' "$OVERRIDES_FILE" | head -1)
+        if [ -n "$EXTRACTED_SA" ]; then
+            WATCHER_SA="$EXTRACTED_SA"
+        fi
+    fi
+
+    if [ -n "$CONTROL_PLANE_LOCATION" ]; then
+        CPA_BASE="https://${CONTROL_PLANE_LOCATION}-apigee.googleapis.com/v1"
+    else
+        CPA_BASE="https://apigee.googleapis.com/v1"
+    fi
+    CPA_URL="${CPA_BASE}/organizations/${APIGEE_ORG}/controlPlaneAccess"
+
+    TMP_CPA=$(mktemp)
+    print_command curl -s -X PATCH -H "Authorization: Bearer \$TOKEN" \
+        -H "Content-Type: application/json" \
+        "${CPA_URL}?update_mask=watcher_identities" \
+        -d "{\"watcher_identities\": [\"serviceAccount:${WATCHER_SA}\"]}"
+
+    HTTP_CODE=$(curl -s -w "%{http_code}" -o "$TMP_CPA" -X PATCH \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json" \
+        "${CPA_URL}?update_mask=watcher_identities" \
+        -d "{\"watcher_identities\": [\"serviceAccount:${WATCHER_SA}\"]}")
+
+    if [ "$HTTP_CODE" -ge 400 ]; then
+        ERR_OUT=$(cat "$TMP_CPA")
+        rm -f "$TMP_CPA"
+        error "Failed to update controlPlaneAccess for watcher_identities (HTTP $HTTP_CODE).\nDetails:\n$ERR_OUT"
+    fi
+
+    # Wait for long-running operation if returned by the API
+    LRO_NAME=$(grep -o '"name": *"organizations/[^"]*operations/[^"]*"' "$TMP_CPA" | head -1 | awk -F '"' '{print $4}')
+    rm -f "$TMP_CPA"
+
+    if [ -n "$LRO_NAME" ]; then
+        log "Waiting for controlPlaneAccess operation ($LRO_NAME) to complete..."
+        while true; do
+            TOKEN=$(gcloud auth print-access-token)
+            TMP_OP=$(mktemp)
+            curl -s -o "$TMP_OP" -H "Authorization: Bearer $TOKEN" "${CPA_BASE}/${LRO_NAME}"
+            if grep -q '"done": *true' "$TMP_OP"; then
+                rm -f "$TMP_OP"
+                break
+            fi
+            rm -f "$TMP_OP"
+            sleep 5
+        done
+    fi
+
+    # Verify the grant landed using getControlPlaneAccess
+    log "Verifying watcherIdentities grant on controlPlaneAccess..."
+    TMP_VERIFY=$(mktemp)
+    print_command curl -s -X GET -H "Authorization: Bearer \$TOKEN" \
+        -H "Content-Type: application/json" \
+        "$CPA_URL"
+    curl -s -o "$TMP_VERIFY" -X GET \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Content-Type: application/json" \
+        "$CPA_URL"
+
+    if grep -q "serviceAccount:${WATCHER_SA}" "$TMP_VERIFY"; then
+        log "Verified: watcher service account '${WATCHER_SA}' is present in watcherIdentities."
+        rm -f "$TMP_VERIFY"
+    else
+        ERR_OUT=$(cat "$TMP_VERIFY")
+        rm -f "$TMP_VERIFY"
+        error "Verification failed: '${WATCHER_SA}' not found in watcherIdentities.\nResponse:\n$ERR_OUT"
+    fi
+}
+
+# Ensure GKE Workload Identity IAM binding for MCP Server KSA -> apigee-watcher GSA
+ensure_mcp_workload_identity() {
+    log "Ensuring Workload Identity bindings for MCP Server ServiceAccount..."
+    bind_wif "apigee-watcher" "$(get_org_encoded_name "apigee-watcher" "$APIGEE_ORG")"
+    bind_wif "apigee-watcher" "$(get_org_encoded_name "apigee-mcp-server" "$APIGEE_ORG")"
+
+    # Also bind any dynamically created apigee-mcp-server KSA in the cluster
+    MCP_KSAS=$(kubectl get sa -n "$APIGEE_NAMESPACE" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n' | grep '^apigee-mcp-server' || true)
+    for ksa in $MCP_KSAS; do
+        bind_wif "apigee-watcher" "$ksa"
+    done
+}
+
+# Step 3 & Step 4: Upgrade apigee-operator chart first, then apigee-org chart
+upgrade_mcp_helm_charts() {
+    log "Applying Apigee CRDs for version $APIGEE_VERSION..."
+    install_crds
+
+    # Detect existing Helm release name for apigee-operator (defaults to 'operator')
+    DETECTED_OP_RELEASE=$(helm list -n "$APIGEE_NAMESPACE" 2>/dev/null | awk '$9 ~ /apigee-operator/ {print $1; exit}')
+    APIGEE_OPERATOR_RELEASE_NAME="${APIGEE_OPERATOR_RELEASE_NAME:-${DETECTED_OP_RELEASE:-operator}}"
+
+    log "Step 3: Upgrading apigee-operator chart (release: $APIGEE_OPERATOR_RELEASE_NAME)..."
+    run_with_spin "Upgrading apigee-operator Helm release..." helm upgrade "$APIGEE_OPERATOR_RELEASE_NAME" apigee-operator/ \
+        --install \
+        --namespace "$APIGEE_NAMESPACE" \
+        --create-namespace \
+        --atomic \
+        -f "$OVERRIDES_FILE"
+
+    run_with_spin "Confirming apigee-controller-manager deployment rollout..." \
+        kubectl rollout status deploy -n "$APIGEE_NAMESPACE" apigee-controller-manager --timeout=2m
+
+    # Detect existing Helm release name for apigee-org (defaults to APIGEE_ORG)
+    DETECTED_ORG_RELEASE=$(helm list -n "$APIGEE_NAMESPACE" 2>/dev/null | awk '$9 ~ /apigee-org/ {print $1; exit}')
+    APIGEE_ORG_RELEASE_NAME="${APIGEE_ORG_RELEASE_NAME:-${DETECTED_ORG_RELEASE:-$APIGEE_ORG}}"
+
+    log "Step 4: Upgrading apigee-org chart (release: $APIGEE_ORG_RELEASE_NAME)..."
+    run_with_spin "Upgrading apigee-org Helm release..." helm upgrade "$APIGEE_ORG_RELEASE_NAME" apigee-org/ \
+        --install \
+        --namespace "$APIGEE_NAMESPACE" \
+        --atomic \
+        -f "$OVERRIDES_FILE"
+}
+
+# Step 5: Verify the MCP installation
+verify_mcp_installation() {
+    log "Step 5: Verifying Apigee MCP Server installation in namespace '$APIGEE_NAMESPACE'..."
+
+    # Ensure Workload Identity is bound for any newly created MCP KSA
+    ensure_mcp_workload_identity
+
+    # 1. Verify MCP ApigeeDeployment and Pods
+    log "Waiting for MCP ApigeeDeployment and pods (label: app=apigee-mcp-server)..."
+    WAIT_COUNT=0
+    while [ "$WAIT_COUNT" -lt 30 ]; do
+        MCP_PODS=$(kubectl get pods -n "$APIGEE_NAMESPACE" -l app=apigee-mcp-server -o name 2>/dev/null || true)
+        if [ -n "$MCP_PODS" ]; then
+            break
+        fi
+        log "Waiting for MCP pods to be scheduled... ($((WAIT_COUNT * 10))s elapsed)"
+        sleep 10
+        WAIT_COUNT=$((WAIT_COUNT + 1))
+    done
+
+    if [ -z "$MCP_PODS" ]; then
+        error "No MCP pods (app=apigee-mcp-server) found in namespace '$APIGEE_NAMESPACE' after 300s."
+    fi
+
+    run_with_spin "Waiting for MCP pods to reach Ready state (2/2 Running)..." \
+        kubectl wait --for=condition=Ready pod -l app=apigee-mcp-server -n "$APIGEE_NAMESPACE" --timeout=300s
+
+    log "Inspecting MCP ApigeeDeployment custom resource:"
+    print_command kubectl get apigeedeployment -n "$APIGEE_NAMESPACE" -l app=apigee-mcp-server
+    kubectl get apigeedeployment -n "$APIGEE_NAMESPACE" -l app=apigee-mcp-server || true
+
+    log "Inspecting MCP Pods:"
+    print_command kubectl get pod -n "$APIGEE_NAMESPACE" -l app=apigee-mcp-server
+    kubectl get pod -n "$APIGEE_NAMESPACE" -l app=apigee-mcp-server || true
+
+    # 2. Verify MCP Service
+    log "Inspecting MCP Service:"
+    print_command kubectl get svc -n "$APIGEE_NAMESPACE" -l app=apigee-mcp-server
+    kubectl get svc -n "$APIGEE_NAMESPACE" -l app=apigee-mcp-server || true
+
+    # 3. Verify MCP HorizontalPodAutoscaler
+    log "Inspecting MCP HorizontalPodAutoscaler:"
+    print_command kubectl get hpa -n "$APIGEE_NAMESPACE"
+    kubectl get hpa -n "$APIGEE_NAMESPACE" | grep apigee-mcp-server || true
+
+    # 4. Verify Message Processor pods received the hostAliases entry
+    log "Verifying Message Processor (apigee-runtime) pods received MCP hostAliases..."
+    MP_PODS=$(kubectl get pods -n "$APIGEE_NAMESPACE" -l app=apigee-runtime -o name 2>/dev/null || true)
+    if [ -n "$MP_PODS" ]; then
+        MISSING_ALIAS=0
+        for mp_pod in $MP_PODS; do
+            ALIAS_CHECK=$(kubectl get "$mp_pod" -n "$APIGEE_NAMESPACE" -o jsonpath='{.spec.hostAliases}' 2>/dev/null || true)
+            case "$ALIAS_CHECK" in
+                *mcp.apigee.internal*) ;;
+                *) MISSING_ALIAS=1 ;;
+            esac
+        done
+
+        if [ "$MISSING_ALIAS" -eq 1 ]; then
+            warn "One or more Message Processor pods are missing the MCP hostAliases entry."
+            log "Forcing fresh staged canary release by deleting current Message Processor pods..."
+            run_with_spin "Deleting apigee-runtime pods to refresh spec..." \
+                kubectl delete pod -n "$APIGEE_NAMESPACE" -l app=apigee-runtime
+            sleep 10
+            run_with_spin "Waiting for new Message Processor pods to be Ready..." \
+                kubectl wait --for=condition=Ready pod -l app=apigee-runtime -n "$APIGEE_NAMESPACE" --timeout=300s
+        fi
+
+        log "Message Processor hostAliases verification:"
+        print_command kubectl get pods -n "$APIGEE_NAMESPACE" -l app=apigee-runtime \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.hostAliases}{"\n"}{end}'
+        kubectl get pods -n "$APIGEE_NAMESPACE" -l app=apigee-runtime \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.hostAliases}{"\n"}{end}' || true
+    else
+        warn "No Message Processor pods (app=apigee-runtime) found in namespace '$APIGEE_NAMESPACE'."
+    fi
+
+    log "=========================================================="
+    log "Apigee MCP Server enablement and verification completed!"
+    log "=========================================================="
+}
+
+# Standalone flow to enable MCP on an already existing Apigee Hybrid installation
+enable_mcp_on_existing() {
+    log "Starting Apigee MCP Enablement on existing Apigee Hybrid installation..."
+    check_mcp_version_compatibility
+
+    # Ensure kubectl context is configured for the target cluster
+    run_with_spin "Fetching cluster credentials..." \
+        gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$CLUSTER_REGION" --project "$PROJECT_ID"
+
+    step "MCP-1" "Edit overrides.yaml to enable MCP Server"
+    configure_mcp_in_overrides
+
+    step "MCP-2" "Grant watcher identity access to MCP configuration on Control Plane"
+    enable_mcp_control_plane_access
+
+    step "MCP-3" "Ensure Workload Identity bindings for MCP"
+    ensure_mcp_workload_identity
+
+    step "MCP-4" "Upgrade apigee-operator and apigee-org Helm charts"
+    upgrade_mcp_helm_charts
+
+    step "MCP-5" "Verify MCP data plane installation & Message Processor hostAliases"
+    verify_mcp_installation
+}
+
+# ==========================================
 # Main Execution
 # ==========================================
 main() {
-    log "Starting Apigee Hybrid v1.16 GKE Deployment Script..."
+    parse_args "$@"
     check_prereqs
+    prompt_deployment_options
+
+    # If standalone MCP enablement mode is selected for an existing installation
+    if [ "$MCP_ONLY_MODE" = "true" ]; then
+        enable_mcp_on_existing
+        exit 0
+    fi
+
+    log "Starting Apigee Hybrid v${APIGEE_VERSION} GKE Deployment Script (MCP Enabled: ${ENABLE_MCP})..."
+    if [ "$ENABLE_MCP" = "true" ]; then
+        check_mcp_version_compatibility
+    fi
     
     step 1 "Create a Cluster"
     setup_project
@@ -977,6 +1421,11 @@ main() {
     install_apigee_env
     install_apigee_env_group
 
+    if [ "$ENABLE_MCP" = "true" ]; then
+        step 12 "Verify Apigee MCP Server Installation"
+        verify_mcp_installation
+    fi
+
     log "=========================================================="
     log "Apigee Hybrid Deployment Complete!"
     log "Next steps required for full functionality:"
@@ -984,5 +1433,6 @@ main() {
     log "=========================================================="
 }
 
-main
+main "$@"
+
 
