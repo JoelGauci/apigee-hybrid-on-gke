@@ -1,0 +1,173 @@
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background-color: #0b0b0b;
+  color: #cfcfcf;
+  font-family: "DejaVu Sans Mono", "Liberation Mono", "Courier New", Courier, monospace;
+  font-size: 15px;
+  line-height: 1.35;
+  padding: 24px 32px;
+  -webkit-font-smoothing: antialiased;
+}
+
+.terminal-container {
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.board-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: #e5e5e5;
+  margin-bottom: 22px;
+  padding-left: 160px;
+  letter-spacing: 0.3px;
+}
+
+.underlined {
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  color: #d8d8d8;
+}
+
+.tasks-table {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+}
+
+.table-header {
+  display: flex;
+  align-items: center;
+  margin-bottom: 18px;
+  color: #d8d8d8;
+}
+
+.table-row {
+  display: flex;
+  align-items: center;
+  min-height: 21px;
+  white-space: nowrap;
+}
+
+.col-progress {
+  width: 300px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+}
+
+.table-header .col-progress {
+  justify-content: center;
+}
+
+.col-sep {
+  width: 22px;
+  flex-shrink: 0;
+  text-align: center;
+  color: #a8a8a8;
+  user-select: none;
+}
+
+.col-time {
+  width: 54px;
+  flex-shrink: 0;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.col-state {
+  width: 96px;
+  flex-shrink: 0;
+  text-align: center;
+}
+
+.table-header .col-task {
+  padding-left: 4px;
+}
+
+.col-task {
+  flex-grow: 1;
+  padding-left: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Segmented horizontal progress bar matching lab-bootstrap TUI */
+.progress-bar {
+  display: grid;
+  grid-template-columns: repeat(30, 1fr);
+  gap: 1px;
+  width: 100%;
+  height: 15px;
+  background-color: #141414;
+  border: 1px solid #222222;
+}
+
+.progress-segment {
+  height: 100%;
+  background-color: #1b1b1b;
+  transition: background-color 0.2s ease;
+}
+
+.progress-segment.filled-completed {
+  background-color: #555753;
+}
+
+.progress-segment.filled-running {
+  background-color: #729fcf;
+}
+
+.progress-segment.filled-running-head {
+  background-color: #ad7fa8;
+  animation: pulse-head 1s infinite alternate;
+}
+
+.progress-segment.filled-failed {
+  background-color: #cc0000;
+}
+
+@keyframes pulse-head {
+  from {
+    opacity: 0.65;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.state-completed {
+  color: #cfcfcf;
+}
+
+.state-in-progress {
+  color: #8ae234;
+}
+
+.state-pending {
+  color: #6c6c6c;
+}
+
+.state-failed {
+  color: #ef2929;
+  font-weight: 700;
+}
+
+.row-pending .col-time,
+.row-pending .col-task {
+  color: #777777;
+}
+
+.row-in-progress .col-task,
+.row-in-progress .col-time {
+  color: #ffffff;
+}
+
+.row-failed .col-task,
+.row-failed .col-time {
+  color: #ef2929;
+}

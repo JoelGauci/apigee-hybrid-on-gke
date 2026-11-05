@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Apigee Hybrid - Lab Startup Tasks</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <main class="terminal-container" role="main">
+    <h1 id="board-title" class="board-title">- Lab Startup Tasks -</h1>
+
+    <div class="tasks-table" role="table" aria-label="Deployment Tasks Progress">
+      <div class="table-header" role="row">
+        <div class="col-progress" role="columnheader"><span class="underlined">Progress</span></div>
+        <div class="col-sep" aria-hidden="true"></div>
+        <div class="col-time" role="columnheader"><span class="underlined">Time</span></div>
+        <div class="col-sep" aria-hidden="true"></div>
+        <div class="col-state" role="columnheader"><span class="underlined">State</span></div>
+        <div class="col-sep" aria-hidden="true"></div>
+        <div class="col-task" role="columnheader"><span class="underlined">Task</span></div>
+      </div>
+
+      <div id="tasks-body" class="table-body" role="rowgroup"></div>
+    </div>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

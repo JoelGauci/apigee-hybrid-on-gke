@@ -41,10 +41,16 @@ APIGEE_NAMESPACE="${APIGEE_NAMESPACE:-apigee}"
 OVERRIDES_FILE="${OVERRIDES_FILE:-overrides.yaml}"
 ENABLE_MCP="${ENABLE_MCP:-false}"
 CONTROL_PLANE_LOCATION="${CONTROL_PLANE_LOCATION:-}"
+ENABLE_WEB_TRACKER="${ENABLE_WEB_TRACKER:-true}"
+TRACKER_HOST="${TRACKER_HOST:-127.0.0.1}"
+TRACKER_PORT="${TRACKER_PORT:-8080}"
 
 # Internal runtime flags
 MCP_ONLY_MODE="false"
 CLI_MCP_FLAG_SET="false"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+TRACKER_SCRIPT="${SCRIPT_DIR}/tracker/tracker.py"
+CURRENT_TASK_ID=""
 
 # ==========================================
 # Helper Functions
@@ -74,6 +80,78 @@ error() {
     exit 1
 }
 
+# ==========================================
+# Task Progress Tracking (Web UI)
+# ==========================================
+begin_task() {
+    task_id="$1"
+    task_name="$2"
+    task_eta="${3:-60}"
+    CURRENT_TASK_ID="$task_id"
+
+    if [ "$ENABLE_WEB_TRACKER" = "true" ] && [ -f "$TRACKER_SCRIPT" ] && command -v python3 >/dev/null 2>&1; then
+        python3 "$TRACKER_SCRIPT" begin "$task_id" "$task_name" "$task_eta" >/dev/null 2>&1 || true
+    fi
+    if command -v lab-bootstrap >/dev/null 2>&1; then
+        lab-bootstrap begin "$task_id" "$task_name" "$task_eta" >/dev/null 2>&1 || true
+    fi
+}
+
+end_task() {
+    task_id="$1"
+    if [ "$ENABLE_WEB_TRACKER" = "true" ] && [ -f "$TRACKER_SCRIPT" ] && command -v python3 >/dev/null 2>&1; then
+        python3 "$TRACKER_SCRIPT" end "$task_id" >/dev/null 2>&1 || true
+    fi
+    if command -v lab-bootstrap >/dev/null 2>&1; then
+        lab-bootstrap end "$task_id" >/dev/null 2>&1 || true
+    fi
+    if [ "$CURRENT_TASK_ID" = "$task_id" ]; then
+        CURRENT_TASK_ID=""
+    fi
+}
+
+fail_task() {
+    task_id="$1"
+    if [ -z "$task_id" ]; then
+        return 0
+    fi
+    if [ "$ENABLE_WEB_TRACKER" = "true" ] && [ -f "$TRACKER_SCRIPT" ] && command -v python3 >/dev/null 2>&1; then
+        python3 "$TRACKER_SCRIPT" fail "$task_id" >/dev/null 2>&1 || true
+    fi
+    if command -v lab-bootstrap >/dev/null 2>&1; then
+        lab-bootstrap fail "$task_id" >/dev/null 2>&1 || true
+    fi
+}
+
+on_script_exit() {
+    exit_code=$?
+    if [ "$exit_code" -ne 0 ] && [ -n "$CURRENT_TASK_ID" ]; then
+        fail_task "$CURRENT_TASK_ID"
+    fi
+}
+
+trap 'on_script_exit' EXIT
+
+start_web_tracker() {
+    tracker_mode="${1:-full}"
+    if [ "$ENABLE_WEB_TRACKER" != "true" ]; then
+        return 0
+    fi
+    if ! command -v python3 >/dev/null 2>&1 || [ ! -f "$TRACKER_SCRIPT" ]; then
+        warn "python3 or tracker/tracker.py not found; skipping web progress tracker."
+        return 0
+    fi
+
+    python3 "$TRACKER_SCRIPT" init "$tracker_mode" --title "- Lab Startup Tasks -" >/dev/null 2>&1 || true
+
+    if ! curl -s -o /dev/null --max-time 1 "http://${TRACKER_HOST}:${TRACKER_PORT}/status.json" 2>/dev/null; then
+        nohup python3 "$TRACKER_SCRIPT" serve --host "$TRACKER_HOST" --port "$TRACKER_PORT" >/dev/null 2>&1 &
+        sleep 1
+    fi
+
+    log "Web progress tracker available at: http://${TRACKER_HOST}:${TRACKER_PORT}"
+}
+
 usage() {
     cat << 'EOF'
 Usage: ./deploy_apigee_hybrid.sh [OPTIONS]
@@ -84,6 +162,8 @@ Options:
   --enable-mcp        Enable Apigee MCP Server during full deployment (requires Apigee Hybrid 1.17.0+)
   --no-mcp            Do not enable Apigee MCP Server during deployment
   --enable-mcp-only   Enable Apigee MCP Server on an already existing Apigee Hybrid installation
+  --tracker-port PORT Port for the Web progress tracker UI (default: 8080)
+  --no-tracker        Disable the Web progress tracker UI
   -h, --help          Display this help message and exit
 
 Environment Variables (can also be configured in .env):
@@ -91,6 +171,9 @@ Environment Variables (can also be configured in .env):
   APIGEE_ORG          Apigee Organization name (defaults to PROJECT_ID)
   APIGEE_VERSION      Apigee Hybrid version (e.g., 1.17.0)
   ENABLE_MCP          Set to "true" or "false" to enable/disable MCP by default
+  ENABLE_WEB_TRACKER  Set to "true" or "false" to enable/disable Web tracker (default: true)
+  TRACKER_HOST        Bind address for Web tracker (default: 127.0.0.1)
+  TRACKER_PORT        Port for Web tracker (default: 8080)
 EOF
 }
 
@@ -109,6 +192,16 @@ parse_args() {
                 MCP_ONLY_MODE="true"
                 ENABLE_MCP="true"
                 CLI_MCP_FLAG_SET="true"
+                ;;
+            --tracker-port)
+                shift
+                if [ $# -eq 0 ]; then
+                    error "--tracker-port requires a port number."
+                fi
+                TRACKER_PORT="$1"
+                ;;
+            --no-tracker)
+                ENABLE_WEB_TRACKER="false"
                 ;;
             -h|--help)
                 usage
@@ -1330,26 +1423,42 @@ verify_mcp_installation() {
 # Standalone flow to enable MCP on an already existing Apigee Hybrid installation
 enable_mcp_on_existing() {
     log "Starting Apigee MCP Enablement on existing Apigee Hybrid installation..."
+    start_web_tracker "mcp-only"
+
+    begin_task "mcp-version" "Check Apigee Hybrid version & Helm charts" 30
     check_mcp_version_compatibility
+    end_task "mcp-version"
 
     # Ensure kubectl context is configured for the target cluster
+    begin_task "mcp-creds" "Fetch GKE cluster credentials" 15
     run_with_spin "Fetching cluster credentials..." \
         gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$CLUSTER_REGION" --project "$PROJECT_ID"
+    end_task "mcp-creds"
 
     step "MCP-1" "Edit overrides.yaml to enable MCP Server"
+    begin_task "mcp-overrides" "Configure enableMcpServer in overrides.yaml" 10
     configure_mcp_in_overrides
+    end_task "mcp-overrides"
 
     step "MCP-2" "Grant watcher identity access to MCP configuration on Control Plane"
+    begin_task "mcp-cpa" "Grant watcher identity access on Control Plane" 30
     enable_mcp_control_plane_access
+    end_task "mcp-cpa"
 
     step "MCP-3" "Ensure Workload Identity bindings for MCP"
+    begin_task "mcp-wif" "Ensure Workload Identity bindings for MCP" 30
     ensure_mcp_workload_identity
+    end_task "mcp-wif"
 
     step "MCP-4" "Upgrade apigee-operator and apigee-org Helm charts"
+    begin_task "mcp-helm" "Upgrade apigee-operator and apigee-org charts" 180
     upgrade_mcp_helm_charts
+    end_task "mcp-helm"
 
     step "MCP-5" "Verify MCP data plane installation & Message Processor hostAliases"
+    begin_task "mcp-verify" "Verify MCP installation & MP hostAliases" 120
     verify_mcp_installation
+    end_task "mcp-verify"
 }
 
 # ==========================================
@@ -1366,70 +1475,141 @@ main() {
         exit 0
     fi
 
+    if [ "$ENABLE_MCP" = "true" ]; then
+        start_web_tracker "full-mcp"
+    else
+        start_web_tracker "full"
+    fi
+
     log "Starting Apigee Hybrid v${APIGEE_VERSION} GKE Deployment Script (MCP Enabled: ${ENABLE_MCP})..."
     if [ "$ENABLE_MCP" = "true" ]; then
         check_mcp_version_compatibility
     fi
     
     step 1 "Create a Cluster"
+    begin_task "setup-project" "Prepare GCP project & enable APIs" 60
     setup_project
+    end_task "setup-project"
+
+    begin_task "setup-gke" "Create GKE cluster & node pools" 600
     setup_gke
+    end_task "setup-gke"
     
     step "1a" "Create an Apigee hybrid organization"
+    begin_task "create-org" "Create Apigee hybrid organization" 180
     create_apigee_organization
+    end_task "create-org"
     
     step "1b" "Create an external IP address for ingress"
+    begin_task "create-ip" "Reserve external IP address for ingress" 30
     setup_apigee_external_ip
+    end_task "create-ip"
 
     step "1c" "Create an environment & env. group"
+    begin_task "create-env" "Create Apigee environment & env group" 120
     create_apigee_environment_and_group
+    end_task "create-env"
     
     step 2 "Download the Apigee Helm charts"
+    begin_task "download-charts" "Download Apigee hybrid Helm charts" 45
     download_helm_charts
+    end_task "download-charts"
     
     step 3 "Create the apigee namespace"
+    begin_task "create-ns" "Create Kubernetes apigee namespace" 10
     create_apigee_namespace
+    end_task "create-ns"
     
     step 4 "Create service accounts"
+    begin_task "create-sa" "Create GCP Service Accounts" 300
     setup_service_accounts
+    end_task "create-sa"
     
     step 5 "Set up service account authentication"
+    begin_task "setup-wif" "Configure Workload Identity bindings" 150
     setup_workload_identity
+    end_task "setup-wif"
     
     step 6 "Create TLS certificates"
+    begin_task "create-certs" "Generate TLS certificates" 15
     setup_networking
+    end_task "create-certs"
     
     step 7 "Create the overrides"
+    if [ "$ENABLE_MCP" = "true" ]; then
+        begin_task "create-overrides" "Create & configure overrides.yaml (MCP enabled)" 10
+    else
+        begin_task "create-overrides" "Create & configure overrides.yaml" 10
+    fi
     check_overrides
+    end_task "create-overrides"
     
     step 8 "Enable Control Plane access"
+    if [ "$ENABLE_MCP" = "true" ]; then
+        begin_task "enable-cpa" "Enable Control Plane & MCP watcher access" 30
+    else
+        begin_task "enable-cpa" "Enable Control Plane access" 30
+    fi
     enable_control_plane_access
+    end_task "enable-cpa"
     
     step 9 "Install cert-manager"
+    begin_task "install-certmgr" "Install cert-manager on GKE" 90
     install_cert_manager
+    end_task "install-certmgr"
     
     step 10 "Install the Apigee hybrid CRDs"
+    begin_task "install-crds" "Install Apigee hybrid CRDs" 30
     install_crds
+    end_task "install-crds"
     
     step 11 "Install Apigee hybrid Using Helm"
+    begin_task "helm-operator" "Install Apigee Operator (Helm)" 120
     install_apigee_operator
+    end_task "helm-operator"
+
+    begin_task "helm-datastore" "Install Apigee Cassandra Datastore (Helm)" 480
     install_apigee_datastore
+    end_task "helm-datastore"
+
+    begin_task "helm-telemetry" "Install Apigee Telemetry (Helm)" 90
     install_apigee_telemetry
+    end_task "helm-telemetry"
+
+    begin_task "helm-redis" "Install Apigee Redis (Helm)" 120
     install_apigee_redis
+    end_task "helm-redis"
+
+    begin_task "helm-ingress" "Install Apigee Ingress Manager (Helm)" 90
     install_apigee_ingress_manager
+    end_task "helm-ingress"
+
+    begin_task "helm-org" "Install Apigee Organization (Helm)" 180
     install_apigee_org
+    end_task "helm-org"
+
+    begin_task "helm-env" "Install Apigee Environment (Helm)" 240
     install_apigee_env
+    end_task "helm-env"
+
+    begin_task "helm-envgroup" "Install Apigee Env Group / Virtualhost (Helm)" 120
     install_apigee_env_group
+    end_task "helm-envgroup"
 
     if [ "$ENABLE_MCP" = "true" ]; then
         step 12 "Verify Apigee MCP Server Installation"
+        begin_task "verify-mcp" "Verify Apigee MCP Server installation" 120
         verify_mcp_installation
+        end_task "verify-mcp"
     fi
 
     log "=========================================================="
     log "Apigee Hybrid Deployment Complete!"
     log "Next steps required for full functionality:"
     log ". Setup Ingress routing/load balancer point."
+    if [ "$ENABLE_WEB_TRACKER" = "true" ]; then
+        log ". Web progress tracker: http://${TRACKER_HOST}:${TRACKER_PORT}"
+    fi
     log "=========================================================="
 }
 

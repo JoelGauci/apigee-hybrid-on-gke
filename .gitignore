@@ -3,3 +3,5 @@ service-accounts
 backup
 overrides-*
 openssl.cnf
+bin/
+tracker/status.json

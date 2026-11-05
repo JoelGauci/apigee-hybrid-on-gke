@@ -55,6 +55,9 @@ You can customize the deployment by editing the `.env` file in the project root 
 | `OVERRIDES_FILE` | `overrides-${APIGEE_VERSION}.yaml` | Path to the generated/used Helm overrides file |
 | `ENABLE_MCP` | `false` | Set to `"true"` to enable Apigee MCP Server by default |
 | `CONTROL_PLANE_LOCATION` | *(empty)* | Optional region prefix if your Apigee org uses Data Residency |
+| `ENABLE_WEB_TRACKER` | `true` | Starts a local Web UI (`http://127.0.0.1:8080`) to track deployment progress in real time |
+| `TRACKER_HOST` | `127.0.0.1` | Bind address for the Web progress tracker server |
+| `TRACKER_PORT` | `8080` | HTTP port for the Web progress tracker UI |
 
 ---
 
