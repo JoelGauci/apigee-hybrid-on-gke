@@ -226,11 +226,13 @@ prompt_deployment_options() {
         return 0
     fi
 
-    # Check if an existing Apigee Hybrid installation is present in the cluster
+    # Check if an existing Apigee Hybrid installation is present in the cluster (with short timeout to avoid hanging on stale kubeconfig)
     EXISTING_INSTALL="false"
-    if kubectl get apigeeorganization -n "$APIGEE_NAMESPACE" >/dev/null 2>&1 || \
-       helm status "$APIGEE_ORG" -n "$APIGEE_NAMESPACE" >/dev/null 2>&1; then
-        EXISTING_INSTALL="true"
+    if kubectl cluster-info --request-timeout=5s >/dev/null 2>&1; then
+        if kubectl get apigeeorganization -n "$APIGEE_NAMESPACE" --request-timeout=5s >/dev/null 2>&1 || \
+           helm status "$APIGEE_ORG" -n "$APIGEE_NAMESPACE" >/dev/null 2>&1; then
+            EXISTING_INSTALL="true"
+        fi
     fi
 
     if [ "$EXISTING_INSTALL" = "true" ]; then
@@ -468,13 +470,14 @@ check_prereqs() {
         printf "[INFO] 'gum' not found. Installing 'gum' for visual tracking...\n"
         if command -v apt >/dev/null 2>&1; then
             sudo mkdir -p /etc/apt/keyrings
-            curl -fsSL https://repo.charm.sh/apt/gpg.key | sudo gpg --dearmor -yes -o /etc/apt/keyrings/charm.gpg
+            curl -fsSL https://repo.charm.sh/apt/gpg.key | sudo gpg --dearmor --yes -o /etc/apt/keyrings/charm.gpg
             echo "deb [signed-by=/etc/apt/keyrings/charm.gpg] https://repo.charm.sh/apt/ * *" | sudo tee /etc/apt/sources.list.d/charm.list >/dev/null
-            sudo apt update -y && sudo apt install gum -y || warn "Failed to install gum."
+            sudo DEBIAN_FRONTEND=noninteractive apt-get update -y && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y gum || warn "Failed to install gum."
         else
             warn "apt not found, skipped gum installation. Execution will proceed without visuals."
         fi
     fi
+    log "Prerequisites check completed."
 }
 
 # ==========================================
@@ -1235,23 +1238,39 @@ enable_mcp_control_plane_access() {
     fi
     CPA_URL="${CPA_BASE}/organizations/${APIGEE_ORG}/controlPlaneAccess"
 
-    TMP_CPA=$(mktemp)
     print_command curl -s -X PATCH -H "Authorization: Bearer \$TOKEN" \
         -H "Content-Type: application/json" \
         "${CPA_URL}?update_mask=watcher_identities" \
         -d "{\"watcher_identities\": [\"serviceAccount:${WATCHER_SA}\"]}"
 
-    HTTP_CODE=$(curl -s -w "%{http_code}" -o "$TMP_CPA" -X PATCH \
-        -H "Authorization: Bearer $TOKEN" \
-        -H "Content-Type: application/json" \
-        "${CPA_URL}?update_mask=watcher_identities" \
-        -d "{\"watcher_identities\": [\"serviceAccount:${WATCHER_SA}\"]}")
+    CPA_RETRY=0
+    CPA_MAX_RETRIES=24
+    while true; do
+        TOKEN=$(gcloud auth print-access-token)
+        TMP_CPA=$(mktemp)
+        HTTP_CODE=$(curl -s -w "%{http_code}" -o "$TMP_CPA" -X PATCH \
+            -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            "${CPA_URL}?update_mask=watcher_identities" \
+            -d "{\"watcher_identities\": [\"serviceAccount:${WATCHER_SA}\"]}")
 
-    if [ "$HTTP_CODE" -ge 400 ]; then
+        if [ "$HTTP_CODE" -lt 400 ]; then
+            break
+        fi
+
+        if grep -qiE "locked by another operation|FAILED_PRECONDITION|ABORTED" "$TMP_CPA" && [ "$CPA_RETRY" -lt "$CPA_MAX_RETRIES" ]; then
+            LOCK_OP=$(grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' "$TMP_CPA" | head -1)
+            rm -f "$TMP_CPA"
+            CPA_RETRY=$((CPA_RETRY + 1))
+            log "Control Plane resource is locked by ongoing operation (${LOCK_OP:-in-progress}). Waiting 5s before retry (${CPA_RETRY}/${CPA_MAX_RETRIES})..."
+            sleep 5
+            continue
+        fi
+
         ERR_OUT=$(cat "$TMP_CPA")
         rm -f "$TMP_CPA"
         error "Failed to update controlPlaneAccess for watcher_identities (HTTP $HTTP_CODE).\nDetails:\n$ERR_OUT"
-    fi
+    done
 
     # Wait for long-running operation if returned by the API
     LRO_NAME=$(grep -o '"name": *"organizations/[^"]*operations/[^"]*"' "$TMP_CPA" | head -1 | awk -F '"' '{print $4}')
